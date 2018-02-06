@@ -35,7 +35,7 @@ module RestClient
     attr_reader :method, :url, :headers, :cookies,
                 :payload, :user, :password, :timeout, :max_redirects,
                 :open_timeout, :raw_response, :processed_headers, :args,
-                :ssl_opts
+                :ssl_opts, :proxy
 
     def self.execute(args, & block)
       new(args).execute(& block)
@@ -48,7 +48,7 @@ module RestClient
     #
     # This list will be used by default if the Ruby global OpenSSL default
     # ciphers appear to be a weak list.
-    DefaultCiphers = %w{
+    DefaultCiphers     = %w{
       !aNULL
       !eNULL
       !EXPORT
@@ -96,23 +96,28 @@ module RestClient
 
     # A set of weak default ciphers that we will override by default.
     WeakDefaultCiphers = Set.new([
-      "ALL:!ADH:!EXPORT:!SSLv2:RC4+RSA:+HIGH:+MEDIUM:+LOW",
-    ])
+                                     "ALL:!ADH:!EXPORT:!SSLv2:RC4+RSA:+HIGH:+MEDIUM:+LOW",
+                                 ])
 
     SSLOptionList = %w{client_cert client_key ca_file ca_path cert_store
                        version ciphers verify_callback verify_callback_warnings}
 
     def initialize args
-      @method = args[:method] or raise ArgumentError, "must pass :method"
+      @method  = args[:method] or raise ArgumentError, "must pass :method"
       @headers = args[:headers] || {}
+
+      #very hacky way to use proxy
+      @proxy   = @headers[:proxy]
+      @headers.delete(:proxy) if @headers[:proxy]
+
       if args[:url]
         @url = process_url_params(args[:url], headers)
       else
         raise ArgumentError, "must pass :url"
       end
-      @cookies = @headers.delete(:cookies) || args[:cookies] || {}
-      @payload = Payload.generate(args[:payload])
-      @user = args[:user]
+      @cookies  = @headers.delete(:cookies) || args[:cookies] || {}
+      @payload  = Payload.generate(args[:payload])
+      @user     = args[:user]
       @password = args[:password]
       if args.include?(:timeout)
         @timeout = args[:timeout]
@@ -121,7 +126,7 @@ module RestClient
         @open_timeout = args[:open_timeout]
       end
       @block_response = args[:block_response]
-      @raw_response = args[:raw_response] || false
+      @raw_response   = args[:raw_response] || false
 
       @ssl_opts = {}
 
@@ -160,15 +165,15 @@ module RestClient
         # If we're on a Ruby version that has insecure default ciphers,
         # override it with our default list.
         if WeakDefaultCiphers.include?(
-             OpenSSL::SSL::SSLContext::DEFAULT_PARAMS.fetch(:ciphers))
+            OpenSSL::SSL::SSLContext::DEFAULT_PARAMS.fetch(:ciphers))
           @ssl_opts[:ciphers] = DefaultCiphers
         end
       end
 
-      @tf = nil # If you are a raw request, this is your tempfile
-      @max_redirects = args[:max_redirects] || 10
+      @tf                = nil # If you are a raw request, this is your tempfile
+      @max_redirects     = args[:max_redirects] || 10
       @processed_headers = make_headers headers
-      @args = args
+      @args              = args
     end
 
     def execute & block
@@ -182,6 +187,7 @@ module RestClient
     def verify_ssl
       @ssl_opts.fetch(:verify_ssl)
     end
+
     SSLOptionList.each do |key|
       define_method('ssl_' + key) do
         @ssl_opts[key.to_sym]
@@ -240,18 +246,21 @@ module RestClient
     def valid_cookie_key?(string)
       return false if string.empty?
 
-      ! Regexp.new('[\x0-\x1f\x7f=;, ]').match(string)
+      !Regexp.new('[\x0-\x1f\x7f=;, ]').match(string)
     end
 
     # Validate cookie values. Rather than following RFC 6265, allow anything
     # but control characters, comma, and semicolon.
     def valid_cookie_value?(value)
-      ! Regexp.new('[\x0-\x1f\x7f,;]').match(value)
+      !Regexp.new('[\x0-\x1f\x7f,;]').match(value)
     end
 
-    def net_http_class
+    def net_http_class(http_proxy = nil)
       if RestClient.proxy
         proxy_uri = URI.parse(RestClient.proxy)
+        Net::HTTP::Proxy(proxy_uri.host, proxy_uri.port, proxy_uri.user, proxy_uri.password)
+      elsif http_proxy
+        proxy_uri = URI.parse(http_proxy)
         Net::HTTP::Proxy(proxy_uri.host, proxy_uri.port, proxy_uri.user, proxy_uri.password)
       else
         Net::HTTP
@@ -277,8 +286,8 @@ module RestClient
     end
 
     def parse_url_with_auth(url)
-      uri = parse_url(url)
-      @user = CGI.unescape(uri.user) if uri.user
+      uri       = parse_url(url)
+      @user     = CGI.unescape(uri.user) if uri.user
       @password = CGI.unescape(uri.password) if uri.password
       if !@user && !@password
         @user, @password = Netrc.read[uri.host]
@@ -349,18 +358,19 @@ module RestClient
     def transmit uri, req, payload, & block
       setup_credentials req
 
-      net = net_http_class.new(uri.host, uri.port)
-      net.use_ssl = uri.is_a?(URI::HTTPS)
+      net = net_http_class(@proxy).new(uri.host, uri.port)
+
+      net.use_ssl     = uri.is_a?(URI::HTTPS)
       net.ssl_version = ssl_version if ssl_version
-      net.ciphers = ssl_ciphers if ssl_ciphers
+      net.ciphers     = ssl_ciphers if ssl_ciphers
 
       net.verify_mode = verify_ssl
 
-      net.cert = ssl_client_cert if ssl_client_cert
-      net.key = ssl_client_key if ssl_client_key
-      net.ca_file = ssl_ca_file if ssl_ca_file
-      net.ca_path = ssl_ca_path if ssl_ca_path
-      net.cert_store = ssl_cert_store if ssl_cert_store
+      net.cert        = ssl_client_cert if ssl_client_cert
+      net.key         = ssl_client_key if ssl_client_key
+      net.ca_file     = ssl_ca_file if ssl_ca_file
+      net.ca_path     = ssl_ca_path if ssl_ca_path
+      net.cert_store  = ssl_cert_store if ssl_cert_store
 
       # We no longer rely on net.verify_callback for the main SSL verification
       # because it's not well supported on all platforms (see comments below).
@@ -518,9 +528,9 @@ module RestClient
     def log_request
       return unless RestClient.log
 
-      out = []
+      out           = []
       sanitized_url = begin
-        uri = URI.parse(url)
+        uri          = URI.parse(url)
         uri.password = "REDACTED" if uri.password
         uri.to_s
       rescue URI::InvalidURIError
