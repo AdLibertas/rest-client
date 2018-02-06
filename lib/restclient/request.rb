@@ -105,10 +105,7 @@ module RestClient
     def initialize args
       @method  = args[:method] or raise ArgumentError, "must pass :method"
       @headers = args[:headers] || {}
-
-      #very hacky way to use proxy
-      @proxy   = @headers[:proxy]
-      @headers.delete(:proxy) if @headers[:proxy]
+      @proxy   = args.fetch(:proxy) if args.include?(:proxy)
 
       if args[:url]
         @url = process_url_params(args[:url], headers)
